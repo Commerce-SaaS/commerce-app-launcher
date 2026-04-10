@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  notifications-ms:
+    build: ../notifications-ms
+    ports:
+      - "4005:4005"
+    env_file:
+      - ../.env
+    volumes:
+      - ../notifications-ms:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run start:dev

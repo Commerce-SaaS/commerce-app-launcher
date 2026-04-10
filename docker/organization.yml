@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  organization-ms:
+    build: ../organization-ms
+    ports:
+      - "4003:4003"
+    env_file:
+      - ../.env
+    volumes:
+      - ../organization-ms:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run start:dev

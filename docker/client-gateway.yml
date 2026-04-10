@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  client-gateway:
+    build: ../client-gateway
+    ports:
+      - "4000:4000"
+    env_file:
+      - ../.env
+    volumes:
+      - ../client-gateway:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started

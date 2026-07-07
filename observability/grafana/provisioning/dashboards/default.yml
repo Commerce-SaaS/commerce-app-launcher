@@ -1,0 +1,20 @@
+# Grafana dashboard file-provider provisioning
+#
+# This tells Grafana to watch /etc/grafana/dashboards (inside the container)
+# and load any .json files it finds there as dashboards.
+#
+# The docker-compose volume mount wires that path to ./observability/grafana/dashboards
+# on the host, so dropping a JSON file there is all you need to publish a dashboard.
+
+apiVersion: 1
+
+providers:
+  - name: default
+    orgId: 1
+    folder: products-ms       # Dashboard appears under this folder in the Grafana UI
+    type: file
+    disableDeletion: false    # Allow dashboard deletion via UI (useful in dev)
+    updateIntervalSeconds: 60 # Grafana re-reads the directory every 60 s
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

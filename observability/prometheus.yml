@@ -1,0 +1,32 @@
+# prometheus.yml — Prometheus scrape configuration
+#
+# Prometheus works by PULLING metrics from targets on a regular interval.
+# Each `scrape_config` block defines one group of targets and how to reach them.
+#
+# To add a new microservice later: copy the products-ms job block, change
+# job_name and the target address. That is all you need.
+
+global:
+  # How often to scrape each target.
+  scrape_interval: 15s
+  # How often to evaluate recording/alerting rules (none defined here yet).
+  evaluation_interval: 15s
+
+scrape_configs:
+
+  # ---- products-ms --------------------------------------------------------
+  # The metrics sidecar runs on port 9100 inside the container.
+  # `products-ms` resolves via Docker Compose service DNS on app-network.
+  - job_name: "products-ms"
+    static_configs:
+      - targets: ["products-ms:9100"]
+    # Every scraped metric will carry the label job="products-ms".
+    # The dashboard uses this to filter process_resident_memory_bytes to
+    # only show the products-ms process.
+
+  # ---- redis-exporter -----------------------------------------------------
+  # oliver006/redis_exporter exposes Redis server metrics on port 9121.
+  # No code changes required in the Redis container itself.
+  - job_name: "redis-exporter"
+    static_configs:
+      - targets: ["redis-exporter:9121"]

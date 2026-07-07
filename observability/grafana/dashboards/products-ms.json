@@ -1,0 +1,216 @@
+{
+  "annotations": { "list": [] },
+  "description": "products-ms observability: cache efficiency, DB latency, Redis health, process memory.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["products-ms", "cache", "redis"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "products-ms Observability",
+  "uid": "products-ms-obs-v1",
+  "version": 1,
+  "panels": [
+
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Cache Hit Ratio",
+      "description": "What fraction of reads were served from Redis without touching the database.\n\n1.0 (100%) = perfect — every read was a cache hit.\nDrops after a deploy (cold cache) or after heavy writes (many invalidations) are normal.\nA sustained low ratio means TTLs are too short or write volume is very high.\n\nNote: 'products' label = findAll list keys; 'product' label = findOne item keys.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": ["mean", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "legendFormat": "{{entity}} / {{operation}}",
+          "expr": "sum(rate(products_ms_cache_hits_total[5m])) by (entity, operation)\n/\n(\n  sum(rate(products_ms_cache_hits_total[5m])) by (entity, operation)\n  +\n  sum(rate(products_ms_cache_misses_total[5m])) by (entity, operation)\n)"
+        }
+      ]
+    },
+
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "DB Query Duration — p50 / p95 / p99",
+      "description": "How long the database takes to answer when the cache misses (or when withDeleted=true bypasses the cache).\n\np50 (median): half of all queries are faster than this.\np95: 95% of queries are faster — a good SLO target.\np99: worst-case tail — spikes here indicate occasional slow queries (index scans, lock contention, cold connection pool).\n\nA flat, low p99 with a higher p99 spike = temporary issue. A rising p99 baseline = investigate query plans.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 5 },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": ["mean", "lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "legendFormat": "p50 — {{entity}} / {{operation}}",
+          "expr": "histogram_quantile(0.50,\n  sum(rate(products_ms_db_query_duration_seconds_bucket[5m])) by (le, entity, operation)\n)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "B",
+          "legendFormat": "p95 — {{entity}} / {{operation}}",
+          "expr": "histogram_quantile(0.95,\n  sum(rate(products_ms_db_query_duration_seconds_bucket[5m])) by (le, entity, operation)\n)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "C",
+          "legendFormat": "p99 — {{entity}} / {{operation}}",
+          "expr": "histogram_quantile(0.99,\n  sum(rate(products_ms_db_query_duration_seconds_bucket[5m])) by (le, entity, operation)\n)"
+        }
+      ]
+    },
+
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Redis Memory — used vs maxmemory cap",
+      "description": "How much RAM Redis is currently using vs the hard cap set via --maxmemory 256mb in docker-compose.\n\nWhen used_memory reaches maxmemory, Redis starts evicting keys according to the volatile-lru policy (evicts least-recently-used keys that have a TTL set — which is all of our cache keys).\n\nHealthy headroom: keep used_memory below ~80% of maxmemory. If it consistently hits the cap, either raise maxmemory or reduce cache TTLs.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "maxmemory (cap)" },
+            "properties": [
+              { "id": "custom.lineStyle", "value": { "dash": [8, 4], "fill": "dash" } },
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "legendFormat": "used_memory",
+          "expr": "redis_memory_used_bytes"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "B",
+          "legendFormat": "maxmemory (cap)",
+          "expr": "redis_config_maxmemory"
+        }
+      ]
+    },
+
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Redis Evicted Keys Rate",
+      "description": "Keys evicted per second. Eviction fires when Redis reaches maxmemory and a new write arrives.\n\nWith volatile-lru policy: Redis removes the least-recently-used key that has a TTL — so cache keys are the first to go, which is correct behaviour.\n\nA non-zero rate here means the cache is under memory pressure. Acceptable in short bursts; sustained eviction = cache is effectively smaller than you think, hurting your hit ratio.\n\nFix: raise maxmemory, reduce TTLs, or add Redis memory to the server.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "short",
+          "displayName": "evictions/s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": ["mean", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "legendFormat": "evicted keys/s",
+          "expr": "rate(redis_evicted_keys_total[5m])"
+        }
+      ]
+    },
+
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "products-ms Process Memory (RSS)",
+      "description": "Resident Set Size — the physical RAM the products-ms Node.js process holds in the container.\n\nExpect a gradual rise at startup as NestJS and TypeORM initialise, then a stable plateau.\n\nA plateau that keeps climbing over hours without traffic growth = memory leak. Common culprits in NestJS:\n  - Event listeners added but never removed\n  - TypeORM query results cached in application memory\n  - Large arrays kept in module-level variables\n\nFiltered to job='products-ms' so this panel shows only this service even if other microservices are instrumented later.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "calcs": ["lastNotNull", "max"],
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "refId": "A",
+          "legendFormat": "RSS",
+          "expr": "process_resident_memory_bytes{job=\"products-ms\"}"
+        }
+      ]
+    }
+
+  ]
+}

@@ -1,0 +1,21 @@
+# Grafana datasource provisioning
+#
+# Grafana reads this file on startup and automatically creates the Prometheus
+# datasource — no manual click-through in the UI required.
+#
+# The `uid` field ("prometheus") must match the `datasource.uid` values inside
+# every panel in the dashboard JSON. If you rename the uid here you must update
+# the dashboard JSON too.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # This uid is referenced in every panel's datasource.uid field.
+    uid: prometheus
+    url: http://prometheus:9090
+    access: proxy      # Grafana backend proxies requests — browser never talks to Prometheus directly
+    isDefault: true
+    editable: false    # Prevent accidental changes via the UI
+    version: 1

@@ -1,1147 +1,225 @@
-# 🚀 Commerce App Launcher
+# Commerce App Launcher
 
-A production-ready, microservices-based SaaS platform designed for e-commerce operations. This project orchestrates multiple independent services using Docker Compose, enabling scalable, modular commerce functionality with event-driven architecture.
+A microservices-based commerce/restaurant-POS platform. This repository is the orchestration layer: it holds the root `docker-compose.yml`, shared environment configuration, an observability stack, and each backend service as a Git submodule. It contains no application code of its own.
 
-**Status**: Enterprise-grade | **Stack**: NestJS | TypeORM | PostgreSQL | RabbitMQ | Redis
+All eight services are NestJS applications written in TypeScript, communicating over RabbitMQ (RPC request/response and topic-exchange events). PostgreSQL (via TypeORM) and Redis are shared infrastructure; several services also integrate with Stripe and AWS S3.
 
----
-
-## 🎯 Project Overview
-
-The Commerce App Launcher is the central orchestration hub for a distributed e-commerce platform. It coordinates multiple specialized microservices through an API Gateway, enabling seamless communication via REST APIs and asynchronous event-driven messaging.
-
-**Key Capabilities:**
-- 🔐 User authentication with JWT (access, refresh, reset tokens)
-- 📦 Product catalog management
-- 🏢 Multi-organization support
-- 🛒 Order management & lifecycle
-- 💳 Payment processing with Stripe integration
-- 📧 Email notifications
-- 📁 Media asset management with AWS S3
-- ⚡ Real-time caching with Redis
-- 🔄 Asynchronous task processing with RabbitMQ
-
-This is **not** a standalone application—it's an orchestration platform where each service is independently deployable and scalable.
+**This README, and the per-service READMEs it links to, document only what was verified directly in the source code of this repository as of 2026-07-16. Anything the audit could not confirm is marked "TODO: verify" — including in the linked service READMEs. Do not treat unmarked statements below as more certain than the underlying service README.**
 
 ---
 
-## 🏗️ System Architecture
+## Services
 
-The system follows a **microservices architecture** with event-driven patterns. Services communicate through:
-- **Synchronous**: REST HTTP calls via API Gateway
-- **Asynchronous**: RabbitMQ message queues for commands and events
+| Service | Directory | Role | Real port | Public HTTP API |
+|---|---|---|---|---|
+| Client Gateway | [`client-gateway/`](client-gateway/README.md) | Single HTTP entry point for clients (SaaS dashboard + storefront); auths requests, proxies to backend services over RabbitMQ, terminates Stripe webhooks | 4000 | Yes (only service with HTTP routes) |
+| Auth MS | [`auth-ms/`](auth-ms/README.md) | Authentication/session/profile management for SaaS staff users and organization customers (JWT, Redis sessions, Google OAuth) | 4002 (RMQ only; no HTTP listener is bound — see note below) | No |
+| Product MS | [`product-ms/`](product-ms/README.md) | Product catalog: products, categories, tags, ingredients, extras | 4001 (RMQ only; no HTTP listener) — also runs a real Prometheus `/metrics` server on 9100 | No |
+| Organization MS | [`organization-ms/`](organization-ms/README.md) | Organizations, organization domains, user↔organization memberships/roles | 4003 (RMQ only; no HTTP listener) | No |
+| Orders MS | [`orders-ms/`](orders-ms/README.md) | Orders (dine-in/POS/scheduled), order items, tables, sectors, cash sessions, sales analytics for a restaurant/POS platform | 4007 (RMQ only; no HTTP listener) | No |
+| Payments MS | [`payments-ms/`](payments-ms/README.md) | Payments, payment methods, subscriptions, Stripe (Checkout, Subscriptions, Connect Express) | 4006 (RMQ only; no HTTP listener) | No |
+| Media MS | [`media-ms/`](media-ms/README.md) | File upload/delete backed by AWS S3 | No HTTP/TCP port is actually bound (see note below) | No |
+| Notifications MS | [`notifications-ms/`](notifications-ms/README.md) | Consumes events and sends transactional email (password reset, email verification, email-changed) via SMTP + Handlebars templates | No HTTP/TCP port is actually bound (see note below) | No |
 
-```mermaid
-graph TB
-    Client["👤 Client Application<br/>http://localhost:3000"]
-    
-    subgraph Gateway["🌐 API Gateway Layer"]
-        GW["Client Gateway<br/>:4000"]
-    end
-    
-    subgraph CoreServices["🔧 Core Services"]
-        AUTH["🔐 Auth MS<br/>:4002"]
-        PRODUCTS["📦 Products MS<br/>:4001"]
-        ORG["🏢 Organization MS<br/>:4003"]
-        ORDERS["🛒 Orders MS<br/>:4007"]
-    end
-    
-    subgraph ValueAddedServices["⭐ Value-Added Services"]
-        PAYMENTS["💳 Payments MS<br/>:4006"]
-        MEDIA["📁 Media MS<br/>:4004"]
-        NOTIFICATIONS["📧 Notifications MS<br/>:4005"]
-    end
-    
-    subgraph Infrastructure["📡 Infrastructure"]
-        RMQ["🔄 RabbitMQ<br/>:5672 / 15672"]
-        REDIS["⚡ Redis Cache<br/>:6379"]
-    end
-    
-    subgraph Databases["🗄️ Data Layer"]
-        AUTHDB["🔒 Auth DB<br/>:5433"]
-        PRODUCTSDB["📦 Products DB<br/>:5432"]
-        ORGDB["🏢 Organization DB<br/>:5434"]
-        ORDERSDB["🛒 Orders DB<br/>:5436"]
-        PAYMENTSDB["💳 Payments DB<br/>:5435"]
-    end
-    
-    subgraph ExternalServices["🌍 External APIs"]
-        STRIPE["💳 Stripe API"]
-        AWS["☁️ AWS S3"]
-        SMTP["📧 Email Provider"]
-    end
-    
-    Client -->|REST API| GW
-    
-    GW -->|HTTP| AUTH
-    GW -->|HTTP| PRODUCTS
-    GW -->|HTTP| ORG
-    GW -->|HTTP| ORDERS
-    GW -->|HTTP| PAYMENTS
-    
-    AUTH --> AUTHDB
-    PRODUCTS --> PRODUCTSDB
-    ORG --> ORGDB
-    ORDERS --> ORDERSDB
-    PAYMENTS --> PAYMENTSDB
-    
-    AUTH -.->|Events| RMQ
-    PRODUCTS -.->|Events| RMQ
-    ORG -.->|Events| RMQ
-    ORDERS -.->|Events| RMQ
-    PAYMENTS -.->|Events| RMQ
-    
-    RMQ -.->|Consume| NOTIFICATIONS
-    RMQ -.->|Consume| MEDIA
-    
-    NOTIFICATIONS -->|SMTP| SMTP
-    MEDIA -->|SDK| AWS
-    PAYMENTS -->|API| STRIPE
-    
-    GW -.->|Cache| REDIS
-    AUTH -.->|Cache| REDIS
-    PRODUCTS -.->|Cache| REDIS
-    ORG -.->|Cache| REDIS
-```
+**Important, verified across multiple services:** every backend microservice (everything except `client-gateway`) is bootstrapped with `NestFactory.createMicroservice(..., { transport: Transport.RMQ })` and does **not** call `app.listen(port)` for HTTP. The `PORT` env var each service reads is only used in a startup log line in most of them. The "real port" numbers in the table above are what `docker-compose.yml`, each service's Dockerfile, and `.env.example` agree on for container port mapping — they do not necessarily correspond to an actual listening TCP port inside the container. Several services have inconsistent `EXPOSE`/`.env.example`/compose port values; see each service's README for the specific discrepancy. `client-gateway` is the only service confirmed to open a real HTTP listener.
+
+Only `client-gateway` exposes an HTTP API. All inter-service communication (both from the gateway and between backend services) happens exclusively over RabbitMQ — no service was found making direct HTTP or gRPC calls to another.
 
 ---
 
-## 📦 Services Overview
+## Architecture
 
-### API Gateway
-| Property | Value |
-|----------|-------|
-| **Service** | `client-gateway` |
-| **Port** | `4000` |
-| **Role** | Single entry point for all client requests |
-| **Tech** | NestJS HTTP |
-| **Database** | None (stateless) |
-| **Dependencies** | Redis, RabbitMQ |
+```
+                         ┌────────────┐
+   Client (web/app) ───► │   client-  │  HTTP :4000  (only HTTP entry point)
+                         │  gateway   │
+                         └─────┬──────┘
+                               │  RabbitMQ RPC (per-service queues)
+       ┌───────────┬───────────┼───────────┬───────────┬───────────┐
+       ▼           ▼           ▼           ▼           ▼           ▼
+   auth-ms    product-ms  organization- orders-ms  payments-ms  media-ms
+  (auth_queue) (products_  ms (organi-  (orders_   (payments_   (media_
+               queue)      zation_      queue)      queue)      queue)
+                            queue)
+       │           │           │           │           │
+       │           │           │           │           │
+       └── PostgreSQL (one DB per service) ─┴───────────┘
+                               │
+                    Redis (sessions / cache / idempotency)
+                               │
+             ┌─────────────────────────────────┐
+             │   RabbitMQ topic exchange        │
+             │        "app.events"              │
+             └─────┬───────────────┬─────────────┘
+                    │               │
+             notifications-ms   (cross-service event fan-out,
+             (SMTP, no DB)       see "Event Flows" below)
+```
 
-**Responsibilities:**
-- Request routing to microservices
-- Authentication middleware (JWT validation)
-- Response aggregation
-- Event publishing for client actions
+`media-ms` and `notifications-ms` have no database. `notifications-ms` also has no outbound queue of its own (pure consumer). Diagram reflects only connections found in code — see per-service READMEs for exact queue names and event lists.
+
+### Verified event flows (topic exchange `app.events`)
+
+These are the cross-service RabbitMQ events actually found in the code (not inferred):
+
+- **auth-ms → notifications-ms**: `verify_email.saas`, `verify_email.customer`, `forgot_password.saas`, `forgot_password.customer`, `saas_mailer_email_changed`, `customer_mailer_email_changed` — all consumed by `notifications-ms` on its events queue and rendered as transactional emails.
+- **auth-ms → orders-ms, payments-ms, organization-ms**: `customer.anonymized` (fan-out to all three) — each service nulls/soft-deletes the corresponding customer's PII/records.
+- **auth-ms → (authz consumer)**: `userOrganization.user_authz_refresh` — consumed by `organization-ms`, which rebuilds a Redis-cached list of a user's organizations/roles.
+- **orders-ms → payments-ms**: `order.cancelled` — cancels active payments for the order. (Consumer confirmed in `payments-ms`.)
+- **payments-ms → orders-ms**: `payment.status` — orders-ms updates order state on payment success/failure.
+- **payments-ms → organization-ms**: `organization.update_event`, `organization.clear_stripe_account`/`organization.stripe.clear` — clears a Stripe Connect account reference on the organization.
+- **orders-ms → organization-ms**: RPC call `organization.find_one` (request/response, not an event) — orders-ms reads an organization's scheduling config (`orderSchedulingIntervalMinutes`, `maxDishesPerSlot`, `openingHours`) when validating scheduled orders.
+- **client-gateway → all backend services**: RPC request/response over each service's dedicated queue (`auth_queue`, `organization_queue`, `products_queue`, `orders_queue`, `payments_queue`, `media_queue`) for every proxied HTTP request. The gateway also has dedicated outbound clients for two event-only queues (`RMQ_EVENTS_QUEUE_ORGANIZATION`, `RABBITMQ_QUEUE_EVENTS_PAYMENTS`).
+
+**Stripe webhooks — TODO: verify.** `payments-ms` has no HTTP endpoint and no Stripe signature-verification code; it receives Stripe webhook data as a RabbitMQ event (`payment.webhook`). `client-gateway` does expose `POST /webhooks/platform` and `POST /webhooks/connect` with real Stripe signature verification, but the audit of `payments-ms` could not independently confirm that the gateway is the service that republishes the verified event onto `payment.webhook` — this wiring is plausible but unverified end-to-end.
 
 ---
 
-### 🔐 Authentication microservice (`auth-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4002` |
-| **Database** | `authdb` (port 5433) |
-| **Dependencies** | Redis, RabbitMQ |
-| **External APIs** | Google OAuth |
-
-**Responsibilities:**
-- User registration & login
-- JWT token generation (access, refresh, reset)
-- Password reset flow
-- Email verification
-- Google OAuth integration
-- Session management via Redis
-
-**Key Features:**
-- Refresh token rotation
-- Email-based password recovery
-- Google SSO support
-- Templates for custom mailers
-
-**Message Queues:**
-- Publishes: `auth_queue` (commands), events to `events.notifications_queue`
-- Consumes: User events for external integrations
-
----
-
-### 📦 Products microservice (`products-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4001` |
-| **Database** | `productsdb` (port 5432) |
-| **Dependencies** | Redis, RabbitMQ |
-| **External APIs** | None |
-
-**Responsibilities:**
-- Product CRUD operations
-- Inventory management
-- Product categorization
-- Stock level tracking
-- Product pricing & variants
-
-**Message Queues:**
-- Publishes: `products_queue` (commands), events to `events.products_queue`
-- Consumes: Order & payment events affecting stock
-
----
-
-### 🏢 Organization microservice (`organization-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4003` |
-| **Database** | `organizationdb` (port 5434) |
-| **Dependencies** | Redis, RabbitMQ |
-| **External APIs** | None |
-
-**Responsibilities:**
-- Multi-tenancy support
-- Organization creation & management
-- Tenant configuration
-- Team/workspace management
-- Organization-level settings
-
-**Message Queues:**
-- Publishes: `organization_queue` (commands), events to `events.organization_queue` & `events.authz_queue`
-- Consumes: Authorization and membership events
-
----
-
-### 🛒 Orders microservice (`orders-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4007` |
-| **Database** | `ordersdb` (port 5436) |
-| **Dependencies** | Redis, RabbitMQ |
-| **External APIs** | None |
-
-**Responsibilities:**
-- Order creation & management
-- Order status tracking
-- Order history & fulfillment
-- Inventory coordination
-- Order analytics
-
-**Message Queues:**
-- Publishes: `orders_queue` (commands), events to `events.orders_queue`
-- Consumes: Payment confirmations, inventory updates
-
-**Typical Flow:**
-1. Receives order creation request
-2. Reserves inventory via Products MS
-3. Publishes order.created event
-4. Waits for payment confirmation
-5. Updates order status
-
----
-
-### 💳 Payments microservice (`payments-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4006` |
-| **Database** | `paymentsdb` (port 5435) |
-| **Dependencies** | Redis, RabbitMQ |
-| **External APIs** | Stripe API |
-
-**Responsibilities:**
-- Payment processing via Stripe
-- Payment status tracking
-- Invoice generation
-- Refund handling
-- Webhook validation (Stripe webhooks)
-- Connect account management
-
-**Message Queues:**
-- Publishes: `payments_queue` (commands), events to `events.payments_queue`
-- Consumes: Order events, payment intents
-
-**Stripe Integration:**
-- Processes payment intents
-- Handles webhooks for payment completion
-- Supports Stripe Connect for multi-vendor scenarios
-
----
-
-### 📁 Media microservice (`media-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4004` |
-| **Database** | None (AWS S3 based) |
-| **Dependencies** | RabbitMQ |
-| **External APIs** | AWS S3 |
-
-**Responsibilities:**
-- Media file uploads & storage
-- AWS S3 integration
-- Image resizing & optimization
-- File metadata tracking
-- CDN integration support
-
-**Message Queues:**
-- Publishes: `media_queue` (commands)
-- Consumes: Product/avatar upload events
-
-**Features:**
-- Direct S3 integration via SDK
-- Temporary signed URLs for downloads
-- Support for product images, avatars, documents
-
----
-
-### 📧 Notifications microservice (`notifications-ms`)
-| Property | Value |
-|----------|-------|
-| **Port** | `4005` |
-| **Database** | None (stateless, read-only logs) |
-| **Dependencies** | RabbitMQ |
-| **External APIs** | SMTP (Email provider) |
-
-**Responsibilities:**
-- Email sending
-- Notification templating
-- Email event logging
-- Batch notification processing
-
-**Message Queues:**
-- Subscribes to: `events.notifications_queue` (all notification events)
-
-**Triggered By:**
-- User registration (welcome email)
-- Password reset (reset link)
-- Order created (order confirmation)
-- Payment received (receipt)
-- Organization invites
-- Custom notifications
-
-**Email Provider:**
-- SMTP configuration (Gmail, SendGrid, etc.)
-- Handlebars templating support
-
----
-
-## 🔄 Service Communication
-
-### Synchronous (Request-Response)
-All client requests flow through the **Client Gateway** which internally calls microservices via HTTP.
-
-**Example Flows:**
-
-```
-Client Request:          POST /api/products
-                         ↓
-                    Client Gateway
-                         ↓
-                    Products MS
-                         ↓
-                    Response → Client
-```
-
-### Asynchronous (Event-Driven via RabbitMQ)
-
-Services emit events to RabbitMQ for inter-service communication. This enables loose coupling and handles long-running processes.
-
-#### Command Queues (1-to-1)
-- `auth_queue` → Auth MS commands
-- `products_queue` → Products MS commands
-- `organization_queue` → Organization MS commands
-- `orders_queue` → Orders MS commands
-- `payments_queue` → Payments MS commands
-- `media_queue` → Media MS commands
-- `client_gateway_queue` → Gateway commands
-
-#### Event Queues (1-to-many)
-- `events.notifications_queue` ← Auth, Orders, Payments (fan-out to Notifications MS)
-- `events.organization_queue` ← Organization MS → Authz systems
-- `events.orders_queue` ← Orders MS → Analytics/Reporting
-- `events.payments_queue` ← Payments MS → Orders MS (confirmation)
-- `events.products_queue` ← Products MS → Inventory tracking
-- `events.authz_queue` ← Auth/Organization MS → Authorization systems
-
-#### Example Event Flow:
-
-```
-1. User places order
-   Order MS → RabbitMQ: { type: 'order.created', orderId: '123' }
-   
-2. Multiple subscribers receive event:
-   a) Payments MS: Prepares for payment
-   b) Notifications MS: Sends order confirmation email
-   c) Products MS: Reserves inventory
-   
-3. Payment confirmed
-   Payments MS → RabbitMQ: { type: 'payment.confirmed', orderId: '123' }
-   
-4. Orders MS receives and updates status
-   Orders MS: status = 'confirmed'
-```
-
-### Caching Layer (Redis)
-- **Session Storage**: Auth tokens & user sessions
-- **Data Caching**: Frequently accessed products, organizations
-- **Rate Limiting**: API rate limiting per user/IP
-- **Cache Key Patterns**: `{service}:{entity}:{id}` (e.g., `products:product:5`)
-
----
-
-## 🔐 Authentication Flow
-
-### 1. User Registration/Login
-
-```
-Client
-  ↓ (email + password)
-Auth MS
-  ├─ Validate credentials
-  ├─ Generate JWT tokens:
-  │  ├─ access_token (short-lived: 15min)
-  │  ├─ refresh_token (long-lived: 7days)
-  │  └─ reset_token (for password reset)
-  ├─ Store refresh_token in Redis
-  └─ Emit: user.created → notifications_queue
-       → Sends welcome email
-```
-
-### 2. Request Authentication
-```
-Client Request + access_token
-  ↓
-Client Gateway (middleware)
-  ├─ Validate JWT signature
-  ├─ Check token expiration
-  ├─ Extract user claims
-  └─ Forward to microservice
-     OR
-     (if expired) → Use refresh_token to get new access_token
-
-Microservice
-  ├─ Verify user has required permissions
-  ├─ Process request
-  └─ Return response
-```
-
-### 3. Token Refresh Flow
-```
-Client (access_token expired)
-  ↓
-Auth MS: POST /auth/refresh
-  ├─ Validate refresh_token in Redis
-  ├─ Check for token rotation rules
-  ├─ Issue new access_token
-  └─ Return new token pair
-```
-
-### 4. Password Reset Flow
-```
-Client: POST /auth/forgot-password
-  ↓
-Auth MS
-  ├─ Generate reset_token (short-lived)
-  ├─ Store in Redis with TTL (15min)
-  ├─ Send reset email via notifications_queue
-  │   Email includes: /reset-password?token=xyz
-  │
-Client: POST /auth/reset-password (with reset_token)
-  ├─ Validate reset_token
-  ├─ Hash new password
-  ├─ Update in database
-  └─ Invalidate all sessions in Redis
-```
-
-### 5. Google OAuth
-```
-Client → Google OAuth Consent
-  ↓
-Client redirects to Auth MS: /auth/google/callback
-  ├─ Verify Google token
-  ├─ Find or create user
-  ├─ Issue JWT tokens
-  └─ Redirect to frontend with tokens
-```
-
-**Security Features:**
-- ✅ Refresh token rotation (invalidates old token)
-- ✅ Password hashing with bcrypt
-- ✅ Token blacklisting on logout
-- ✅ CORS validation
-- ✅ Rate limiting on auth endpoints
-- ✅ Email verification before login
-- ✅ Session invalidation on password change
-
----
-
-## ⚙️ Environment Configuration
-
-### Global Environment Variables (`.env`)
-
-```bash
-# Node Environment
-NODE_ENV=development|production|staging
-
-# RABBITMQ
-RABBITMQ_USER=user
-RABBITMQ_PASS=password
-RABBITMQ_HOST=rabbitmq
-RABBITMQ_PORT=5672
-RABBITMQ_URL=amqp://user:password@rabbitmq:5672
-
-# REDIS
-REDIS_HOST=redis
-REDIS_PORT=6379
-
-# CLIENT URLS
-FRONT_URL=http://localhost:3000        # Frontend application URL
-CLIENT_URL=http://localhost:3000       # Client for payments/webhooks
-
-# JWT SECRETS (generate strong values!)
-JWT_SECRET_ACCESS=your_access_secret   # Access token (15 min)
-JWT_SECRET_REFRESH=your_refresh_secret # Refresh token (7 days)
-JWT_SECRET_RESET=your_reset_secret     # Password reset (15 min)
-
-# STRIPE
-STRIPE_SECRET=sk_test_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-STRIPE_CONNECT_WEBHOOK_SECRET=whsec_...
-
-# GOOGLE OAUTH
-GOOGLE_CLIENT_ID=xxx.apps.googleusercontent.com
-
-# SMTP (Email)
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=465
-SMTP_USER=your_email@gmail.com
-SMTP_PASS=app_password
-SMTP_FROM="Your App <noreply@example.com>"
-
-# AWS S3
-AWS_ACCESS_KEY_ID=AKIA...
-AWS_SECRET_ACCESS_KEY=...
-AWS_REGION=us-east-1
-AWS_BUCKET=your-bucket-name
-
-# DATABASE
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=your_secure_password
-DB_PORT=5432
-
-PRODUCTS_DB=productsdb
-AUTH_DB=authdb
-ORGANIZATION_DB=organizationdb
-ORDERS_DB=ordersdb
-PAYMENTS_DB=paymentsdb
-
-# MESSAGE QUEUES (command/topic)
-RABBITMQ_QUEUE_CLIENT_GATEWAY=client_gateway_queue
-RABBITMQ_QUEUE_AUTH=auth_queue
-RABBITMQ_QUEUE_ORGANIZATION=organization_queue
-RABBITMQ_QUEUE_ORDERS=orders_queue
-RABBITMQ_QUEUE_PAYMENTS=payments_queue
-RABBITMQ_QUEUE_PRODUCTS=products_queue
-RABBITMQ_QUEUE_MEDIA=media_queue
-
-# MESSAGE QUEUES (events)
-RMQ_EVENTS_QUEUE_NOTIFICATIONS=events.notifications_queue
-RMQ_EVENTS_QUEUE_ORGANIZATION=events.organization_queue
-RMQ_EVENTS_QUEUE_ORDERS=events.orders_queue
-RMQ_EVENTS_QUEUE_PAYMENTS=events.payments_queue
-RMQ_EVENTS_QUEUE_PRODUCTS=events.products_queue
-RMQ_EVENTS_QUEUE_AUTHZ=events.authz_queue
-```
-
-**Important Security Notes:**
-- 🔒 Never commit `.env` with real secrets
-- 🔒 Use strong, random values for JWT secrets (min 32 chars)
-- 🔒 Rotate secrets periodically
-- 🔒 Use environment-specific configurations
-- 🔒 Store secrets in secure vault (HashiCorp Vault, AWS Secrets Manager)
-
----
-
-## 🐳 Docker & Orchestration
-
-### Network Architecture
-
-```
-┌─────────────────────────────────────────────┐
-│         Docker Network: app-network         │
-├─────────────────────────────────────────────┤
-│ All services communicate through this network│
-│ Services are discoverable by hostname       │
-│ (e.g., rabbitmq:5672, redis:6379)          │
-└─────────────────────────────────────────────┘
-```
-
-### Service Dependencies
-
-**Service startup order (automatic with `depends_on`):**
-
-1. **Infrastructure First**
-   - Redis (no dependencies)
-   - RabbitMQ with healthcheck (30s startup)
-
-2. **Databases** (parallel)
-   - auth-db
-   - products-db
-   - organization-db
-   - orders-db
-   - payments-db
-
-3. **Gateway & Microservices** (parallel, wait for dependencies)
-   - client-gateway (waits: RabbitMQ healthy + Redis started)
-   - auth-ms (waits: auth-db + RabbitMQ + Redis)
-   - products-ms (waits: products-db + RabbitMQ + Redis)
-   - organization-ms (waits: organization-db + RabbitMQ + Redis)
-   - orders-ms (waits: orders-db + RabbitMQ + Redis)
-   - payments-ms (waits: payments-db + RabbitMQ + Redis)
-
-4. **Utility Services** (parallel, wait for RabbitMQ)
-   - media-ms (waits: RabbitMQ)
-   - notifications-ms (waits: RabbitMQ)
-
-### Container Health Monitoring
-
-**RabbitMQ Healthcheck:**
-```yaml
-healthcheck:
-  test: ["CMD", "rabbitmq-diagnostics", "check_running"]
-  interval: 10s
-  timeout: 5s
-  retries: 10
-  start_period: 10s
-```
-
-**Service Volumes:**
-- Each microservice: `./service-name:/usr/src/app` (live reload)
-- Each database: `./service-name/postgres:/var/lib/postgresql/data` (data persistence)
-- Redis: `redis-data:/data` (named volume)
-
-### Port Mappings
-
-| Service | Container Port | Host Port |
-|---------|----------------|-----------|
-| Client Gateway | 4000 | 4000 |
-| Products MS | 4001 | 4001 |
-| Auth MS | 4002 | 4002 |
-| Organization MS | 4003 | 4003 |
-| Media MS | 4004 | 4004 |
-| Notifications MS | 4005 | 4005 |
-| Payments MS | 4006 | 4006 |
-| Orders MS | 4007 | 4007 |
-| RabbitMQ AMQP | 5672 | 5672 |
-| RabbitMQ Dashboard | 15672 | 15672 |
-| Auth DB | 5432 | 5433 |
-| Products DB | 5432 | 5432 |
-| Organization DB | 5432 | 5434 |
-| Payments DB | 5432 | 5435 |
-| Orders DB | 5432 | 5436 |
-| Redis | 6379 | 6379 |
-
----
-
-## 🚀 Getting Started
+## Stack
+
+Verified per-service from each `package.json`:
+
+- **Language**: TypeScript 5.7
+- **Framework**: NestJS 11 (`@nestjs/core`, `@nestjs/common`, `@nestjs/microservices`)
+- **Database**: PostgreSQL 16.2 (Docker image `postgres:16.2`) via TypeORM 0.3 — one database per service (auth-ms, product-ms, organization-ms, orders-ms, payments-ms have their own DB; media-ms and notifications-ms have none)
+- **Messaging**: RabbitMQ (`rabbitmq:3-management` image) via `@nestjs/microservices` (`Transport.RMQ`), `amqplib`, `amqp-connection-manager`
+- **Cache/session store**: Redis 7 (`redis:7` image) via `ioredis`
+- **Env validation**: `zod` in every service (`src/config/envs.ts`) — each service throws at startup if required variables are missing
+- **Payments**: `stripe` SDK (client-gateway and payments-ms)
+- **File storage**: `@aws-sdk/client-s3` (media-ms)
+- **Email**: `@nestjs-modules/mailer` + `nodemailer` + `handlebars` (notifications-ms)
+- **Runtime**: Node 20 (Alpine) in every Dockerfile
+- **Observability**: Prometheus (`prom/prometheus:v2.53.0`), Grafana (`grafana/grafana:11.1.0`), `redis_exporter` — see `observability/` and the docker-compose services below. Of the application services, only `product-ms` has real, code-level Prometheus instrumentation (`prom-client`, a `/metrics` HTTP server on port 9100).
 
 ### Prerequisites
 
-- **Docker** >= 20.10
-- **Docker Compose** >= 2.0
-- **Node.js** >= 18 (for local development without Docker)
-- **Git**
+- Docker and Docker Compose (root `docker-compose.yml` targets the Compose v2 `services:` schema)
+- Node.js 20+ and npm, only needed for running a service outside Docker
+- Git, with submodule support (`git submodule update --init --recursive`)
 
-### 1. Clone & Setup
+---
+
+## Running the Full Stack
+
+Commands verified against the root `docker-compose.yml` and `.env.example`.
 
 ```bash
-# Clone repository
 git clone <repository-url>
 cd commerce-app-launcher
+git submodule update --init --recursive
 
-# Copy environment template
 cp .env.example .env
+# then fill in real secrets — see "Environment Variables" below
 
-# Edit .env with your secrets
-#⚠️ Important: Set strong JWT secrets!
-# ⚠️ Configure Stripe, Google OAuth, SMTP, AWS credentials
-```
-
-### 2. Start All Services
-
-```bash
-# Build and start everything
 docker compose up --build
-
-# Output should show all services starting:
-# ✓ redis
-# ✓ rabbitmq
-# ✓ auth-db (+ other DBs)
-# ✓ client-gateway
-# ✓ auth-ms
-# (all other services...)
 ```
 
-### 3. Verify Services
+This brings up, per `docker-compose.yml`: `redis`, `rabbitmq`, `client-gateway`, `products-ms` + `products-db`, `auth-ms` + `auth-db`, `organization-ms` + `organization-db`, `orders-ms` + `orders-db`, `payments-ms` + `payments-db`, `media-ms`, `notifications-ms`, plus an observability stack (`prometheus`, `redis-exporter`, `grafana`).
+
+Each application service runs `npm run start:dev` inside its container with the service directory bind-mounted for live reload (per the `volumes:` entries in `docker-compose.yml`).
+
+### Port mappings (from `docker-compose.yml`)
+
+| Service | Host port |
+|---|---|
+| client-gateway | 4000 |
+| products-ms | 4001 (+ metrics 9100 on `127.0.0.1` only) |
+| auth-ms | 4002 |
+| organization-ms | 4003 |
+| media-ms | 4004 |
+| notifications-ms | 4005 |
+| payments-ms | 4006 |
+| orders-ms | 4007 |
+| RabbitMQ AMQP | 5672 |
+| RabbitMQ management UI | 15672 |
+| Redis | 6379 (`127.0.0.1` only) |
+| products-db (Postgres) | 5432 (`127.0.0.1` only) |
+| auth-db | 5433 |
+| organization-db | 5434 |
+| payments-db | 5435 |
+| orders-db | 5436 |
+| Prometheus UI | 9090 (`127.0.0.1` only) |
+| Grafana UI | 3001 (`127.0.0.1` only) → container port 3000 |
+
+As noted above, most of these "service" ports (4001–4007, excluding 4000) are container-port mappings from `docker-compose.yml`/`.env.example` that do **not** correspond to an HTTP port the Nest app actually binds — the services are RabbitMQ-only. Treat them as informational/reserved, not as working HTTP endpoints, unless a service's own README says otherwise.
+
+### Running a single service outside Docker
 
 ```bash
-# Check all containers are running
-docker compose ps
-
-# Verify API Gateway is responding
-curl http://localhost:4000/health
-
-# Check RabbitMQ Dashboard
-# Visit: http://localhost:15672 (user: guest, pass: guest)
-
-# Test a service directly
-curl http://localhost:4002/health  # Auth MS health
-```
-
-### 4. Database Initialization
-
-```bash
-# Databases are automatically initialized on first run
-# TypeORM migrations run automatically:
-# - Each service connects to its database
-# - Synchronizes schema based on entities
-# - Creates tables/indexes
-
-# Check database connections
-docker logs auth-ms | grep "connected"
-docker logs products-ms | grep "connected"
-```
-
-### 5. Access Services
-
-| Service | URL | Port |
-|---------|-----|------|
-| Client Gateway | `http://localhost:4000` | 4000 |
-| API Gateway Docs | `http://localhost:4000/api` | - |
-| RabbitMQ Dashboard | `http://localhost:15672` | 15672 |
-| Auth MS | `http://localhost:4002` | 4002 |
-| Products MS | `http://localhost:4001` | 4001 |
-| (Other Services) | See port mappings | - |
-
----
-
-## 🧪 Development Workflow
-
-### Local Development vs Docker
-
-#### Option A: Docker (Recommended for Full Stack)
-```bash
-# All services in containers with live reload
-docker compose up
-
-# Monitor logs
-docker compose logs -f
-
-# Restart a specific service
-docker compose restart auth-ms
-
-# Stop everything
-docker compose down
-```
-
-#### Option B: Hybrid (Service in IDE + Docker Infrastructure)
-```bash
-# Start infrastructure only (no Node services)
-docker compose up redis rabbitmq auth-db products-db organization-db orders-db payments-db media-ms notifications-ms
-
-# In VS Code, run specific service:
+docker compose up redis rabbitmq auth-db   # infra only, example for auth-ms
 cd auth-ms
 npm install
+cp .env.example .env   # then fill in values; auth-ms's own .env.example is missing several vars its schema requires — see auth-ms/README.md
 npm run start:dev
-
-# The service connects to Docker infrastructure
 ```
 
-### Viewing Logs
+Repeat with the relevant `*-db` service(s) for other backend services. Each service's own README documents its exact required environment variables and known gaps in its `.env.example`.
+
+### Stopping / cleaning up
 
 ```bash
-# All services
-docker compose logs -f
-
-# Specific service
-docker compose logs -f auth-ms
-
-# Last 100 lines
-docker compose logs -f --tail=100 products-ms
-
-# Real-time with timestamps
-docker compose logs -f --timestamps
-```
-
-### Debugging
-
-#### VSCode Debugging
-```json
-// .vscode/launch.json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "node",
-      "request": "launch",
-      "name": "Auth MS Debug",
-      "program": "${workspaceFolder}/auth-ms/node_modules/.bin/nest",
-      "args": ["start", "--debug", "--watch"],
-      "console": "integratedTerminal",
-      "internalConsoleOptions": "openOnSessionStart"
-    }
-  ]
-}
-```
-
-#### Access Pod Logs
-```bash
-# SSH into container
-docker compose exec auth-ms bash
-
-# Run commands
-npm run test
-npm run lint
-
-# Check environment
-env | grep RABBITMQ
-```
-
-### Running Tests
-
-```bash
-# Run tests in specific service
-docker compose exec products-ms npm run test
-
-# Watch mode
-docker compose exec auth-ms npm run test:watch
-
-# Coverage
-docker compose exec orders-ms npm run test:cov
-
-# E2E tests
-docker compose exec payments-ms npm run test:e2e
-```
-
-### Database Management
-
-```bash
-# Access database directly
-docker compose exec auth-db psql -U postgres -d authdb
-
-# Common SQL commands
-# \dt → list tables
-# \d users → describe table
-# SELECT * FROM users;
-
-# Backup database
-docker compose exec auth-db pg_dump -U postgres authdb > backup.sql
-
-# Restore database
-docker compose exec -T auth-db psql -U postgres authdb < backup.sql
-```
-
-### Cleaning Up
-
-```bash
-# Stop all services
-docker compose down
-
-# Remove containers + volumes (WARNING: deletes data!)
-docker compose down -v
-
-# Remove only named volumes
-docker volume rm commerce-app-launcher_redis-data
-
-# Prune unused Docker resources
-docker system prune -f
+docker compose down          # stop and remove containers
+docker compose down -v       # also remove named volumes (deletes DB/Redis/Prometheus/Grafana data)
 ```
 
 ---
 
-## 🔁 Real-World Flow Examples
+## Environment Variables
 
-### Example 1: User Registration & Welcome Email
+The root `.env.example` lists the variables `docker-compose.yml` substitutes into each service's container environment. **It is not exhaustive** — the per-service audits found required variables (per each service's own Zod schema) that are missing from both the root `.env.example` and that service's own `.env.example`. Each service's README documents its full, verified variable list and flags exactly which ones are missing from the example files. Do not assume the root `.env.example` alone is sufficient to boot every service; consult the linked service READMEs.
 
-```
-1. Client → POST /api/auth/register
-   { email: "user@example.com", password: "..." }
-                    ↓
-2. Client Gateway routes to Auth MS
-                    ↓
-3. Auth MS
-   ├─ Validate input (zod/class-validator)
-   ├─ Hash password (bcrypt)
-   ├─ Store in authdb
-   ├─ Generate JWT tokens
-   ├─ Store refresh_token in Redis
-   ├─ Emit: user.created event
-   │   { userId: "123", email: "user@example.com" }
-   │   → Published to events.notifications_queue
-   └─ Return access_token to client
-                    ↓
-4. Notifications MS receives event
-   ├─ Render email template (Handlebars)
-   ├─ Send via SMTP
-   └─ Log delivery status
-                    ↓
-5. User receives: "Welcome to Commerce App!"
-```
-
-### Example 2: Product Order Lifecycle
-
-```
-Phase 1: Create Order
-─────────────────────
-Client → POST /api/orders
-{ productIds: ["1", "2"], quantity: [1, 2] }
-        ↓
-Client Gateway → Orders MS
-        ↓
-Orders MS
-├─ Validate inventory with Products MS (HTTP call)
-├─ Reserve inventory
-├─ Create order record (ordersdb)
-├─ Set status = pending_payment
-├─ Emit: order.created
-│   → events.orders_queue (analytics)
-│   → events.notifications_queue (send email)
-└─ Return orderId, sessionId to client
-
-
-Phase 2: Process Payment
-────────────────────────
-Client → POST /api/payments/create-session
-{ orderId: "order-123" }
-        ↓
-Client Gateway → Payments MS
-        ↓
-Payments MS
-├─ Fetch order from Orders MS (HTTP)
-├─ Create Stripe Session
-├─ Emit: payment.session.created
-└─ Return sessionId to client
-        ↓
-Client redirects to Stripe Checkout
-
-
-Phase 3: Payment Confirmation (Webhook)
-────────────────────────────────────────
-Stripe → POST /api/payments/stripe-webhook
-{ type: "checkout.session.completed", ... }
-        ↓
-Payments MS
-├─ Verify webhook signature
-├─ Validate Stripe session completed
-├─ Update payment record (paymentsdb)
-├─ Emit: payment.confirmed { orderId: "order-123" }
-│   → events.payments_queue → Orders MS
-│   → events.notifications_queue → Send receipt
-│   → events.products_queue → Deduct inventory
-└─ Return 200 OK to Stripe
-
-
-Phase 4: Order Fulfillment
-───────────────────────────
-Orders MS receives: payment.confirmed event
-├─ Update order status = confirmed
-├─ Emit: order.confirmed
-│   → events.notifications_queue (send confirmation email)
-└─ Database updated (ordersdb)
-
-Notifications MS receives: order.confirmed
-├─ Render: "Order Confirmed" email
-├─ Include: Order number, tracking link, items
-├─ Send email
-└─ Log delivery
-
-
-Phase 5: Customer Receives Email
-─────────────────────────────────
-✅ Welcome email + payment receipt + order confirmation
-```
-
-### Example 3: Organization Management (Multi-Tenancy)
-
-```
-Create Organization
-───────────────────
-Client → POST /api/organizations
-{ name: "Acme Corp", adminId: "user-123" }
-        ↓
-Client Gateway → Organization MS
-        ↓
-Organization MS
-├─ Validate owner permissions
-├─ Create organization (organizationdb)
-├─ Set owner as admin
-├─ Emit: organization.created
-│   → events.organization_queue
-│   → events.authz_queue (authorization service)
-└─ Return organizationId
-        ↓
-Authorization service updates permissions:
-├─ Grant admin role to owner
-├─ Create default roles (admin, member, viewer)
-└─ Sync permissions cache (Redis)
-
-
-Add Member to Organization
-──────────────────────────
-Client → POST /api/organizations/org-123/members
-{ email: "john@example.com", role: "member" }
-        ↓
-Organization MS
-├─ Verify requester is admin
-├─ Create membership record
-├─ Emit: member.invited
-│   → events.notifications_queue
-└─ Return membership details
-        ↓
-Notifications MS
-├─ Send: "John, you've been invited to Acme Corp"
-├─ Include: Acceptance link with token
-└─ John clicks link → Accepts membership → Added to org
-```
+Root `.env.example` groups (see file for exact keys): `NODE_ENV`, RabbitMQ connection (`RABBITMQ_USER`/`PASS`/`HOST`/`PORT`/`URL`), Redis (`REDIS_HOST`/`PORT`; note **`REDIS_PASS` is not in the root `.env.example`** even though multiple services require it), frontend URL (`CLIENT_URL`), JWT secrets (`JWT_SECRET_ACCESS`/`REFRESH`/`RESET` — **`JWT_SECRET_VERIFY_EMAIL`, required by auth-ms, is missing**), Stripe (`STRIPE_SECRET`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_CONNECT_WEBHOOK_SECRET` — **`STRIPE_PRICE_ID_BASIC`/`STRIPE_PRICE_ID_PRO`, required by payments-ms, are missing**), Google OAuth (`GOOGLE_CLIENT_ID`), SMTP (`SMTP_HOST`/`PORT`/`USER`/`PASS`/`FROM` — **`LOGO_URL`, `APP_NAME`, `APP_URL`, required by notifications-ms, are missing**), AWS (`AWS_ACCESS_KEY_ID`/`SECRET_ACCESS_KEY`/`REGION`/`BUCKET`), database credentials and per-service DB names, and per-service RabbitMQ queue name variables.
 
 ---
 
-## 📌 Important Notes for Developers
+## Repository Structure
 
-### 1. **Service Independence**
-- ✅ Each service has its **own database** (no shared database)
-- ✅ Services are **independently deployable**
-- ❌ Do NOT query another service's database directly
-- ✅ Use HTTP APIs or RabbitMQ for inter-service communication
-
-### 2. **Message Queue Patterns**
-
-**Command Queues** (service-specific):
-- Slower, ordered processing
-- Example: `auth_queue` → only Auth MS consumes
-- Use for: Specific tasks for a service
-
-**Event Queues** (broadcast):
-- Multiple subscribers allowed
-- Example: `events.notifications_queue` ← many services publish
-- Use for: Notifications, analytics, triggering workflows
-
-### 3. **Database Migrations**
-- TypeORM synchronizes schema automatically in dev
-- For production, use migrations:
-  ```bash
-  npm run migration:generate src/migrations/CreateUsersTable
-  npm run migration:run
-  npm run migration:revert
-  ```
-
-### 4. **Error Handling**
-
-```typescript
-// Services should emit error events for failed operations
-// Example: Payment failed
-try {
-  await stripe.createPaymentIntent(...);
-} catch (error) {
-  this.rabbitMQ.publish('events.payments_queue', {
-    type: 'payment.failed',
-    orderId,
-    reason: error.message
-  });
-  throw error; // Let gateway handle 500 response
-}
+```
+commerce-app-launcher/
+├── docker-compose.yml       # Orchestrates all services + infra + observability
+├── .env.example              # Template for shared/root environment variables (incomplete — see above)
+├── .gitmodules                # Each service below is a separate Git submodule
+├── observability/             # Prometheus + Grafana provisioning config
+├── client-gateway/            # HTTP API gateway — see client-gateway/README.md
+├── auth-ms/                   # Authentication/session service — see auth-ms/README.md
+├── product-ms/                # Product catalog service — see product-ms/README.md
+├── organization-ms/           # Organization/membership service — see organization-ms/README.md
+├── orders-ms/                 # Orders/POS service — see orders-ms/README.md
+├── payments-ms/                # Payments/subscriptions/Stripe service — see payments-ms/README.md
+├── media-ms/                  # S3 file storage service — see media-ms/README.md
+└── notifications-ms/           # Transactional email service — see notifications-ms/README.md
 ```
 
-### 5. **Caching Strategy**
-
-```typescript
-// Products MS caching
-const cachedProduct = await redis.get(`products:product:${id}`);
-if (cachedProduct) return JSON.parse(cachedProduct);
-
-const product = await this.db.findProduct(id);
-await redis.setex(`products:product:${id}`, 3600, JSON.stringify(product)); // 1 hour TTL
-return product;
-
-// Invalidate on update
-await redis.del(`products:product:${id}`);
-```
-
-### 6. **Rate Limiting**
-- Configured per service
-- Uses Redis-based tracking
-- Protects auth endpoints especially
-
-### 7. **Logging & Monitoring**
-- Use NestJS Logger in each service
-- Centralized logs via Docker logging driver
-- Recommended: ELK Stack (Elasticsearch, Logstash, Kibana) in production
-
-### 8. **Environment-Specific Configs**
-
-```bash
-# Development
-NODE_ENV=development → auto reload, detailed logs, weak secrets OK
-
-# Staging
-NODE_ENV=staging → real credentials, medium logging
-
-# Production
-NODE_ENV=production → optimized, security strict, minimal logging
-```
-
-### 9. **Adding New Microservice**
-
-1. Create new folder: `service-name-ms/`
-2. Copy structure from existing service (e.g., copy `products-ms/`)
-3. Update database name in `.env`
-4. Add to `docker-compose.yml`:
-   ```yaml
-   new-service-ms:
-     build: ./new-service-ms
-     ports:
-       - "4008:4008"  # Use next available port
-     environment:
-       PORT: 4008
-       DB_HOST: new-service-db
-       # ... other vars
-     depends_on:
-       rabbitmq:
-         condition: service_healthy
-   ```
-5. Run: `docker compose up --build`
-
-### 10. **Performance Considerations**
-- ✅ Use Redis for session caching (avoid DB hits per request)
-- ✅ Batch RabbitMQ messages when processing events
-- ✅ Implement database indexes on frequently queried fields
-- ✅ Use connection pooling (TypeORM default: 10 connections)
-- ✅ Monitor: RabbitMQ queue depths, Redis memory usage, DB connections
+Each service directory is a Git submodule (see `.gitmodules`) tracking its own repository on the `develop` branch.
 
 ---
 
-## 📚 Additional Resources
+## Per-Service Documentation
 
-### Documentation
-- [NestJS Official](https://docs.nestjs.com/)
-- [TypeORM Docs](https://typeorm.io/)
-- [RabbitMQ Tutorials](https://www.rabbitmq.com/getstarted.html)
-- [Docker Compose Spec](https://docs.docker.com/compose/compose-file/)
-
-### Production Checklist
-- [ ] All environment variables in secure vault
-- [ ] HTTPS enabled for all services
-- [ ] Database backups configured
-- [ ] Monitoring & alerting setup (Prometheus, Grafana)
-- [ ] Centralized logging (ELK Stack)
-- [ ] API rate limiting on all endpoints
-- [ ] CORS properly configured
-- [ ] Input validation on all endpoints
-- [ ] Database connection pooling optimized
-- [ ] RabbitMQ persistence enabled
-- [ ] Redis replication setup
+- [Client Gateway](client-gateway/README.md) — HTTP routes, guards, downstream RabbitMQ queue map, Stripe webhook handling
+- [Auth MS](auth-ms/README.md) — all RabbitMQ message patterns, JWT/session model, outbound events
+- [Product MS](product-ms/README.md) — catalog message patterns, data model, Prometheus metrics
+- [Organization MS](organization-ms/README.md) — organization/membership message patterns, Redis cache scheme
+- [Orders MS](orders-ms/README.md) — order/table/sector/cash-session message patterns, inter-service calls
+- [Payments MS](payments-ms/README.md) — payment/subscription/Connect message patterns, what Stripe features are actually implemented
+- [Media MS](media-ms/README.md) — S3 upload/delete message patterns
+- [Notifications MS](notifications-ms/README.md) — consumed email events and templates
 
 ---
 
-## 🤝 Contributing
+## Known Gaps Across the Platform
 
-When modifying this orchestration project:
+Patterns repeated across nearly every service's audit, worth tracking centrally:
 
-1. Update docker-compose.yml for infrastructure changes
-2. Document new environment variables in `.env.example`
-3. Update this README for architecture changes
-4. Test full stack: `docker compose down -v && docker compose up --build`
-5. Verify all services are healthy before committing
+- **No test files exist** in auth-ms, organization-ms, orders-ms (partial — a few `.spec.ts` exist), payments-ms (2 spec files), media-ms, notifications-ms, and product-ms, despite `test`/`test:e2e` scripts being configured in every `package.json`. `client-gateway` has real, extensive `.spec.ts` coverage but its `test:e2e` script is also broken (no `test/` directory).
+- **Every backend service's `.env.example` is missing at least one variable its own Zod schema requires** (commonly `REDIS_PASS`) — copying `.env.example` as-is will fail startup validation in most services. See each service's README for the exact missing keys.
+- **No database migrations exist anywhere** — every service relies on TypeORM `synchronize: true` in development; production migration strategy is not documented in any service's code.
+- **Several services define RabbitMQ pattern constants or client tokens with no corresponding implementation** (dead code) — e.g. unimplemented `find_all`/`restore` patterns in organization-ms and product-ms's join-entity controllers, unused `RabbitMQModule`/`RMQ_SERVICE` clients in media-ms and product-ms. Full detail in each service's README.
+- **Port/`.env.example`/Dockerfile inconsistencies** exist in payments-ms, media-ms, and orders-ms (the value in the Dockerfile's `EXPOSE`, `.env.example`'s `PORT`, and/or the Zod schema's default disagree). Since none of these services bind an actual HTTP port, the practical impact is limited to documentation confusion — see each README.
+- **Refunds and PayPal are not implemented** in payments-ms despite related enum values/pattern constants existing (flagged explicitly in that service's code as `TODO[CRITICAL][REFUND]`).
 
----
+## TODO: Verify (platform-level, not confirmed by this audit)
 
-## 📝 License
-
-Proprietary - All rights reserved.
-
----
-
-**Last Updated**: April 2026 | **Maintainers**: Fernando Ituarte
+- Which service (if any) actually terminates Stripe's real HTTP webhook and republishes it onto `payment.webhook` for payments-ms to consume.
+- Whether the root `.env` (present but gitignored) supplies all variables each service's Zod schema requires — the audits only checked `.env.example` files and source code, not the real `.env`.
+- Production deployment process/CI — no CI config or production deployment scripts were found or reviewed as part of this audit.

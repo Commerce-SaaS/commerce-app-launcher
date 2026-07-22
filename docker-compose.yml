@@ -1,0 +1,455 @@
+services:
+
+  # Redis centralizado
+  redis:
+    image: redis:7
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASS}", "--maxmemory", "256mb", "--maxmemory-policy", "volatile-lru"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+
+  # RabbitMQ con panel de administración y healthcheck
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "127.0.0.1:15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    healthcheck:
+      test: [ "CMD", "rabbitmq-diagnostics", "check_running" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - app-network
+
+  # Client Gateway
+  client-gateway:
+    build: ./client-gateway
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./client-gateway:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4000
+      NODE_ENV: ${NODE_ENV}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASS: ${REDIS_PASS}
+      FRONT_URL: ${FRONT_URL}
+      JWT_SECRET_ACCESS: ${JWT_SECRET_ACCESS}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_CLIENT_GATEWAY}
+      RABBITMQ_QUEUE_EVENTS_PAYMENTS: ${RMQ_EVENTS_QUEUE_PAYMENTS}
+      RMQ_EVENTS_QUEUE_ORGANIZATION: ${RMQ_EVENTS_QUEUE_ORGANIZATION}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      STRIPE_CONNECT_WEBHOOK_SECRET: ${STRIPE_CONNECT_WEBHOOK_SECRET}
+      STRIPE_SECRET: ${STRIPE_SECRET}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # Products microservice
+  products-ms:
+    build: ./product-ms
+    ports:
+      - "4001:4001"
+      - "127.0.0.1:9100:9100"
+    volumes:
+      - ./product-ms/src:/usr/src/app/src
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4001
+      NODE_ENV: ${NODE_ENV}
+      DB_PORT: ${DB_PORT}
+      DB_HOST: products-db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${PRODUCTS_DB}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_PRODUCTS}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASS: ${REDIS_PASS}
+      # Prometheus metrics sidecar — plain HTTP server inside the same container.
+      # Prometheus scrapes this port; it is NOT exposed to the host.
+      METRICS_PORT: 9100
+    depends_on:
+      products-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # Products DB
+  products-db:
+    image: postgres:16.2
+    restart: always
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${PRODUCTS_DB}
+    volumes:
+      - ./product-ms/postgres:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  # Auth microservice
+  auth-ms:
+    build: ./auth-ms
+    ports:
+      - "4002:4002"
+    volumes:
+      - ./auth-ms:/usr/src/app
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4002
+      NODE_ENV: ${NODE_ENV}
+      JWT_SECRET_ACCESS: ${JWT_SECRET_ACCESS}
+      JWT_SECRET_REFRESH: ${JWT_SECRET_REFRESH}
+      JWT_SECRET_RESET: ${JWT_SECRET_RESET}
+      DB_PORT: ${DB_PORT}
+      DB_HOST: auth-db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_DB}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_AUTH}
+      RMQ_EVENTS_QUEUE_NOTIFICATIONS: ${RMQ_EVENTS_QUEUE_NOTIFICATIONS}
+      RMQ_EVENTS_QUEUE_AUTHZ: ${RMQ_EVENTS_QUEUE_AUTHZ}
+      RMQ_EVENTS_QUEUE_ORDERS: ${RMQ_EVENTS_QUEUE_ORDERS}
+      RMQ_EVENTS_QUEUE_PAYMENTS: ${RMQ_EVENTS_QUEUE_PAYMENTS}
+      RMQ_EVENTS_QUEUE_ORGANIZATION: ${RMQ_EVENTS_QUEUE_ORGANIZATION}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASS: ${REDIS_PASS}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      VERIFY_EMAIL_URL: ${VERIFY_EMAIL_URL}
+      RESET_PASSWORD_URL: ${RESET_PASSWORD_URL}
+    depends_on:
+      auth-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # Auth DB
+  auth-db:
+    image: postgres:16.2
+    ports:
+      - "127.0.0.1:5433:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AUTH_DB}
+    restart: always
+    volumes:
+      - ./auth-ms/postgres:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  # Organization microservice
+  organization-ms:
+    build: ./organization-ms
+    ports:
+      - "4003:4003"
+    volumes:
+      - ./organization-ms/src:/usr/src/app/src
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4003
+      NODE_ENV: ${NODE_ENV}
+      DB_PORT: ${DB_PORT}
+      DB_HOST: organization-db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${ORGANIZATION_DB}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_ORGANIZATION}
+      RMQ_EVENTS_QUEUE_ORGANIZATION: ${RMQ_EVENTS_QUEUE_ORGANIZATION}
+      RMQ_EVENTS_QUEUE_AUTHZ: ${RMQ_EVENTS_QUEUE_AUTHZ}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASS: ${REDIS_PASS}
+    depends_on:
+      organization-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # Organization DB
+  organization-db:
+    image: postgres:16.2
+    ports:
+      - "127.0.0.1:5434:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${ORGANIZATION_DB}
+    restart: always
+    volumes:
+      - ./organization-ms/postgres:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  # Order microservice
+  orders-ms:
+    build: ./orders-ms
+    ports:
+      - "4007:4007"
+    volumes:
+      - ./orders-ms/src:/usr/src/app/src
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4007
+      NODE_ENV: ${NODE_ENV}
+      DB_PORT: ${DB_PORT}
+      DB_HOST: orders-db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${ORDERS_DB}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_ORDERS}
+      RMQ_EVENTS_QUEUE_ORDERS: ${RMQ_EVENTS_QUEUE_ORDERS}
+      RMQ_EVENTS_QUEUE_PAYMENTS: ${RMQ_EVENTS_QUEUE_PAYMENTS}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASS: ${REDIS_PASS}
+    depends_on:
+      orders-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # Orders DB
+  orders-db:
+    image: postgres:16.2
+    ports:
+      - "127.0.0.1:5436:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${ORDERS_DB}
+    restart: always
+    volumes:
+      - ./orders-ms/postgres:/var/lib/postgresql/data
+    networks:
+    - app-network
+
+  # Payments microservice
+  payments-ms:
+    build: ./payments-ms
+    ports:
+      - "4006:4006"
+    volumes:
+      - ./payments-ms/src:/usr/src/app/src
+      - /usr/src/app/node_modules
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4006
+      NODE_ENV: ${NODE_ENV}
+      DB_PORT: ${DB_PORT}
+      DB_HOST: payments-db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${PAYMENTS_DB}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_PAYMENTS}
+      RABBITMQ_QUEUE_EVENTS_ORDERS: ${RMQ_EVENTS_QUEUE_ORDERS}
+      RABBITMQ_QUEUE_EVENTS_PAYMENTS: ${RMQ_EVENTS_QUEUE_PAYMENTS}
+      RABBITMQ_QUEUE_EVENTS_ORGANIZATION: ${RMQ_EVENTS_QUEUE_ORGANIZATION}
+      CLIENT_URL: ${CLIENT_URL}
+      STRIPE_PRICE_ID_BASIC: ${STRIPE_PRICE_ID_BASIC}
+      STRIPE_PRICE_ID_PRO: ${STRIPE_PRICE_ID_PRO}
+      STRIPE_SECRET: ${STRIPE_SECRET}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      REDIS_PASS: ${REDIS_PASS}
+    depends_on:
+      payments-db:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - app-network
+
+  # payments DB
+  payments-db:
+    image: postgres:16.2
+    ports:
+      - "127.0.0.1:5435:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${PAYMENTS_DB}
+    restart: always
+    volumes:
+      - ./payments-ms/postgres:/var/lib/postgresql/data
+    networks:
+      - app-network
+
+  # Media microservice
+  media-ms:
+    build: ./media-ms
+    ports:
+      - "4004:4004"
+    volumes:
+      - ./media-ms/src:/usr/src/app/src
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4004
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RABBITMQ_QUEUE: ${RABBITMQ_QUEUE_MEDIA}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      AWS_BUCKET: ${AWS_BUCKET}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # Notifications microservice
+  notifications-ms:
+    build: ./notifications-ms
+    ports:
+      - "4005:4005"
+    volumes:
+      - ./notifications-ms/src:/usr/src/app/src
+    command: npm run start:dev
+    env_file:
+      - .env
+    environment:
+      PORT: 4005
+      NODE_ENV: ${NODE_ENV}
+      RABBITMQ_URL: ${RABBITMQ_URL}
+      RMQ_EVENTS_QUEUE: ${RMQ_EVENTS_QUEUE_NOTIFICATIONS}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+      LOGO_URL: ${LOGO_URL}
+      APP_NAME: ${APP_NAME}
+      APP_URL: ${APP_URL}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  # ---------------------------------------------------------------------------
+  # Observability stack
+  # ---------------------------------------------------------------------------
+
+  # Prometheus — scrapes products-ms:9100 and redis-exporter:9121 every 15 s.
+  # UI at http://localhost:9090 (restricted to loopback for security).
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - products-ms
+      - redis-exporter
+    networks:
+      - app-network
+
+  # redis_exporter — exposes Redis server metrics without any code changes.
+  # Connects to the existing `redis` service using REDIS_PASS from .env.
+  # Prometheus scrapes it at redis-exporter:9121.
+  redis-exporter:
+    image: oliver006/redis_exporter:latest
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASS}
+    depends_on:
+      - redis
+    networks:
+      - app-network
+
+  # Grafana — dashboard UI at http://localhost:3001.
+  # Port 3001 avoids clashing with common local dev servers on 3000.
+  # Datasource and dashboard are auto-provisioned from ./observability/grafana/.
+  grafana:
+    image: grafana/grafana:11.1.0
+    ports:
+      - "127.0.0.1:3001:3000"
+    volumes:
+      # Provisioning dir: datasources + dashboard file-provider config
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      # Dashboard JSON files loaded by the file-provider above
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      # Persistent storage for user preferences, annotations, etc.
+      - grafana-data:/var/lib/grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # Override with GRAFANA_PASSWORD in your .env; defaults to 'admin' if unset.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  app-network:
